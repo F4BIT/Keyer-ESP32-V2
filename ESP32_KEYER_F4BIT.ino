@@ -1,9 +1,14 @@
 
 /*
   ESP32-S3 CW KEYER - v2.2
+
+  Auteur : F4BIT Stéphane
+  Date   : 2026-11
+  Licence: GNU General Public License v3.0
+  
   Carte : ESP32-S3-DevKitC-1-N16R8
   Arduino-ESP32 : version 2.x
-
+  
   Fonctions :
   - Paddle double contact DIT / DAH
   - Manipulation Iambic A/B (alternance simplifiee)
