@@ -1,6 +1,5 @@
-
 /*
-  ESP32-S3 CW KEYER - v2.2
+  ESP32-S3 CW KEYER - v2.3
 
   Auteur : F4BIT Stéphane
   Date   : 2026-11
@@ -47,6 +46,21 @@ const int PTT_TAIL_MS = 100;
 bool iambicB = true;
 bool paddleReverse = DEFAULT_PADDLE_REVERSE;
 bool sidetoneEnabled = true;
+
+// Winkeyer 2.0 (jeu de commandes K1EL compatible K3NG)
+// Le port USB serie fonctionne a 1200 bauds, debit standard Winkeyer.
+bool winkeyHostOpen = false;
+bool winkeyPaused = false;
+bool winkeyKeyImmediate = false;
+uint8_t winkeyPending = 0;
+uint8_t winkeyParamsNeeded = 0;
+uint8_t winkeyParams[16];
+uint8_t winkeyParamIndex = 0;
+uint8_t winkeyAdminPending = 0;
+uint8_t winkeyWeight = 50;
+uint8_t winkeyPttLead = 4;
+uint8_t winkeyPttTail = 10;
+uint8_t winkeyMode = 0;
 
 // =====================================================
 // VARIABLES INTERNES
@@ -203,14 +217,14 @@ void readSpeedPot() {
   potWpm = constrain(potWpm, MIN_WPM, MAX_WPM);
 
   if (potWpm != lastPotWpm) {
-    wpm = potWpm;
-    updateTiming();
-
     lastPotWpm = potWpm;
-
-    Serial.print("Vitesse : ");
-    Serial.print(wpm);
-    Serial.println(" WPM");
+    if (!winkeyHostOpen) {
+      wpm = potWpm;
+      updateTiming();
+      Serial.print("Vitesse : ");
+      Serial.print(wpm);
+      Serial.println(" WPM");
+    }
   }
 }
 
@@ -224,8 +238,10 @@ void readModeButton() {
       iambicB = !iambicB;
       lastModeButton = millis();
 
-      Serial.print("Mode Iambic : ");
-      Serial.println(iambicB ? "B" : "A");
+      if (!winkeyHostOpen) {
+        Serial.print("Mode Iambic : ");
+        Serial.println(iambicB ? "B" : "A");
+      }
     }
   }
 }
@@ -300,7 +316,7 @@ void paddleKeyer() {
     textState = 0;
     textBuffer = "";
     textPosition = 0;
-    Serial.println("Texte interrompu par le paddle.");
+    if (!winkeyHostOpen) Serial.println("Texte interrompu par le paddle.");
   }
 
   if (paddleState == 0) {
@@ -368,8 +384,10 @@ void startText(String text) {
   textState = 0;
   textActive = true;
 
-  Serial.print("Emission : ");
-  Serial.println(textBuffer);
+  if (!winkeyHostOpen) {
+    Serial.print("Emission : ");
+    Serial.println(textBuffer);
+  }
 }
 
 void stopText() {
@@ -381,7 +399,7 @@ void stopText() {
   setCW(false);
   setPTT(false);
 
-  Serial.println("Emission arretee.");
+  if (!winkeyHostOpen) Serial.println("Emission arretee.");
 }
 
 void textKeyer() {
@@ -394,7 +412,7 @@ void textKeyer() {
       textActive = false;
       setCW(false);
 
-      Serial.println("Fin du texte.");
+      if (!winkeyHostOpen) Serial.println("Fin du texte.");
       return;
     }
 
@@ -458,6 +476,24 @@ void processSerialCommand(String command) {
 
   if (command.length() == 0) return;
 
+  // Commandes CLI K3NG (prefixe antislash)
+  if (command == "\\?") {
+    Serial.println("K3NG CLI: \\a Iambic A, \\b Iambic B, \\n inverse paddle, \\o sidetone, \\s statut, \\\\ stop");
+    return;
+  }
+  if (command == "\\a") { iambicB = false; Serial.println("Iambic A"); return; }
+  if (command == "\\b") { iambicB = true; Serial.println("Iambic B"); return; }
+  if (command == "\\n") { paddleReverse = !paddleReverse; Serial.println(paddleReverse ? "Paddle reverse ON" : "Paddle reverse OFF"); return; }
+  if (command == "\\o") { sidetoneEnabled = !sidetoneEnabled; Serial.println(sidetoneEnabled ? "Sidetone ON" : "Sidetone OFF"); return; }
+  if (command == "\\s") {
+    Serial.print("CW Speed WPM: "); Serial.println(wpm);
+    Serial.print("Iambic: "); Serial.println(iambicB ? "B" : "A");
+    Serial.print("Paddle reverse: "); Serial.println(paddleReverse ? "ON" : "OFF");
+    Serial.print("Sidetone: "); Serial.println(sidetoneEnabled ? "ON" : "OFF");
+    return;
+  }
+  if (command == "\\\\") { stopText(); return; }
+
   // Reglage manuel : /W20
   if (command.startsWith("/W")) {
     int value = command.substring(2).toInt();
@@ -514,19 +550,229 @@ void processSerialCommand(String command) {
   startText(command);
 }
 
+// =====================================================
+// EMULATION WINKY 2.0 - SOUS-ENSEMBLE POUR LOGICIELS PC
+// =====================================================
+
+void winkeySendStatus() {
+  // WK status: bits 7..5 = 110, bit 2 = BUSY, bit 1 = BREAK-IN.
+  uint8_t st = 0xC0;
+  if (textActive || cwIsDown || winkeyKeyImmediate) st |= 0x04;
+  if (digitalRead(PIN_DIT) == LOW || digitalRead(PIN_DAH) == LOW) st |= 0x02;
+  Serial.write(st);
+}
+
+void winkeySetSpeed(uint8_t value) {
+  if (value == 0) return; // 0 = vitesse au potentiometre
+  wpm = constrain((int)value, MIN_WPM, MAX_WPM);
+  updateTiming();
+}
+
+void winkeyExecuteAdmin(uint8_t value) {
+  switch (value) {
+    case 1: // Reset logique de l'interface
+      winkeyPaused = false;
+      stopText();
+      winkeyHostOpen = false;
+      break;
+    case 2: // Host Open
+      winkeyHostOpen = true;
+      winkeyPaused = false;
+      // Code de revision emule : Winkeyer 2.x
+      Serial.write((uint8_t)0x20);
+      break;
+    case 3: // Host Close
+      winkeyPaused = false;
+      winkeyPending = 0;
+      winkeyAdminPending = 0;
+      stopText();
+      winkeyHostOpen = false;
+      break;
+    case 4: // Echo test : echo du prochain octet
+      winkeyAdminPending = 4;
+      break;
+    case 10: // WK1 mode
+    case 11: // WK2 mode
+      break;
+    default:
+      // Commandes admin non implementees : aucune reponse inventee.
+      break;
+  }
+}
+
+void winkeyExecuteCommand(uint8_t command, uint8_t *v) {
+  switch (command) {
+    case 0x01: // Sidetone control (WK1/WK2)
+      sidetoneEnabled = ((v[0] & 0x0F) != 0);
+      break;
+    case 0x02: // Speed immediate
+      winkeySetSpeed(v[0]);
+      break;
+    case 0x03: // Weighting
+      winkeyWeight = constrain((int)v[0], 10, 90);
+      break;
+    case 0x04: // PTT lead / tail, pas de changement de cablage
+      winkeyPttLead = v[0];
+      winkeyPttTail = v[1];
+      break;
+    case 0x05: // Speed pot setup (3 octets)
+      break;
+    case 0x06: // Pause
+      winkeyPaused = (v[0] != 0);
+      break;
+    case 0x07: // Get speed pot: commande sans parametre, reponse 10xxxxxx
+      Serial.write((uint8_t)(0x80 | constrain(wpm - MIN_WPM, 0, 63)));
+      break;
+    case 0x08: // Backspace : retire un caractere encore en attente
+      if (textBuffer.length() > textPosition) {
+        textBuffer.remove(textBuffer.length() - 1);
+      }
+      break;
+    case 0x09: // Pin configuration (sorties conservees selon notre cablage)
+      break;
+    case 0x0A: // Clear buffer
+      stopText();
+      winkeyPaused = false;
+      winkeyKeyImmediate = false;
+      break;
+    case 0x0B: // Key immediate / tune
+      winkeyKeyImmediate = (v[0] != 0);
+      setCW(winkeyKeyImmediate);
+      if (winkeyKeyImmediate && USE_EXTERNAL_PTT) setPTT(true);
+      if (!winkeyKeyImmediate) setPTT(false);
+      break;
+    case 0x0D: // Farnsworth - non gere dans ce firmware
+      break;
+    case 0x0E: // Winkeyer mode: Iambic, reverse, serial echo
+      winkeyMode = v[0];
+      iambicB = ((v[0] & 0x30) == 0);
+      paddleReverse = ((v[0] & 0x08) != 0);
+      break;
+    case 0x0F: // Load Defaults, 15 parametres
+      winkeyMode = v[0];
+      iambicB = ((v[0] & 0x30) == 0);
+      paddleReverse = ((v[0] & 0x08) != 0);
+      winkeySetSpeed(v[1]);
+      sidetoneEnabled = ((v[2] & 0x0F) != 0);
+      winkeyWeight = constrain((int)v[3], 10, 90);
+      winkeyPttLead = v[4];
+      winkeyPttTail = v[5];
+      break;
+    case 0x11: // Key compensation - non gere
+      break;
+    case 0x14: // Software paddle
+      if (v[0] == 0) {
+        ditMemory = false; dahMemory = false;
+      } else {
+        if (v[0] & 0x01) ditMemory = true;
+        if (v[0] & 0x02) dahMemory = true;
+      }
+      break;
+    case 0x15: // Request status
+      winkeySendStatus();
+      break;
+    case 0x18: // PTT buffered (traitement immediat simplifie)
+      if (USE_EXTERNAL_PTT) setPTT(v[0] != 0);
+      break;
+    case 0x19: // Key buffered : nn secondes
+      winkeyKeyImmediate = (v[0] != 0);
+      setCW(winkeyKeyImmediate);
+      break;
+    case 0x1C: // Buffered speed change, appliquee immediatement
+      winkeySetSpeed(v[0]);
+      break;
+    default:
+      break;
+  }
+}
+
+uint8_t winkeyParameterCount(uint8_t command) {
+  switch (command) {
+    case 0x01: case 0x02: case 0x03: case 0x06:
+    case 0x09: case 0x0B: case 0x0C: case 0x0D:
+    case 0x0E: case 0x11: case 0x14: case 0x18:
+    case 0x19: case 0x1C:
+      return 1;
+    case 0x04: return 2;
+    case 0x05: return 3;
+    case 0x0F: return 15;
+    case 0x07: case 0x08: case 0x0A: case 0x15:
+      return 0;
+    default: return 0;
+  }
+}
+
+void winkeyReceiveByte(uint8_t b) {
+  if (winkeyAdminPending == 4) {
+    Serial.write(b);
+    winkeyAdminPending = 0;
+    return;
+  }
+  if (winkeyAdminPending == 1) {
+    winkeyAdminPending = 0;
+    winkeyExecuteAdmin(b);
+    return;
+  }
+  if (winkeyPending != 0) {
+    winkeyParams[winkeyParamIndex++] = b;
+    if (winkeyParamIndex >= winkeyParamsNeeded) {
+      winkeyExecuteCommand(winkeyPending, winkeyParams);
+      winkeyPending = 0;
+      winkeyParamIndex = 0;
+      winkeyParamsNeeded = 0;
+    }
+    return;
+  }
+  if (b == 0x00) {
+    winkeyAdminPending = 1;
+    return;
+  }
+  if (b < 0x20) {
+    winkeyPending = b;
+    winkeyParamsNeeded = winkeyParameterCount(b);
+    winkeyParamIndex = 0;
+    if (winkeyParamsNeeded == 0) {
+      winkeyExecuteCommand(b, winkeyParams);
+      winkeyPending = 0;
+    }
+    return;
+  }
+  if (b >= 0x20 && b <= 0x7E) {
+    if (textBuffer.length() < 180) {
+      textBuffer += (char)toupper((char)b);
+      if (!textActive) {
+        textPosition = 0;
+        textElementPosition = 0;
+        textPattern = "";
+        textState = 0;
+        textActive = true;
+      }
+    }
+  }
+}
+
 void readSerialUSB() {
   while (Serial.available()) {
-    char c = Serial.read();
+    uint8_t b = (uint8_t)Serial.read();
 
+    if (winkeyHostOpen || winkeyAdminPending != 0 || winkeyPending != 0 ||
+        b == 0x00 || b < 0x20 || b == 0x7F) {
+      // Les octets de synchronisation Winkeyer (notamment 0x13) arrivent
+      // avant Host Open : ils ne doivent pas polluer le terminal texte.
+      serialLine = "";
+      winkeyReceiveByte(b);
+      continue;
+    }
+
+    // Mode terminal K3NG simplifie conserve lorsque l'hote Winkeyer est ferme.
+    char c = (char)b;
     if (c == '\n' || c == '\r') {
       if (serialLine.length() > 0) {
         processSerialCommand(serialLine);
         serialLine = "";
       }
-    } else {
-      if (serialLine.length() < 200) {
-        serialLine += c;
-      }
+    } else if (serialLine.length() < 200) {
+      serialLine += c;
     }
   }
 }
@@ -536,7 +782,11 @@ void readSerialUSB() {
 // =====================================================
 
 void setup() {
-  Serial.begin(115200);
+  // ESP32-S3 USB natif : dans l'IDE Arduino, activer
+  // Tools > USB CDC On Boot = Enabled et USB Mode = Hardware CDC and JTAG.
+  // Le debit 1200 est celui annonce au pilote Winkeyer ; sur CDC natif,
+  // il s'agit d'un port USB virtuel et non d'une UART physique.
+  Serial.begin(1200); // Winkeyer standard : 1200 bauds, 8 bits, sans parite
 
   pinMode(PIN_DIT, INPUT_PULLUP);
   pinMode(PIN_DAH, INPUT_PULLUP);
@@ -562,22 +812,8 @@ void setup() {
 
   updateTiming();
 
-  Serial.println();
-  Serial.println("==================================");
-  Serial.println(" ESP32-S3 CW KEYER - K3NG simplifie");
-  Serial.println("==================================");
-  Serial.println("Paddle : pret");
-  Serial.println("USB serie : 115200 bauds");
-  Serial.println("Potentiometre : 5 a 50 WPM");
-  Serial.println();
-  Serial.println("Commandes :");
-  Serial.println("  Texte + Entree : emission CW");
-  Serial.println("  /W20            : vitesse 20 WPM");
-  Serial.println("  /A              : Iambic A");
-  Serial.println("  /B              : Iambic B");
-  Serial.println("  /STOP           : arret");
-  Serial.println("  /INFO           : informations");
-  Serial.println();
+  // Ne rien envoyer au demarrage : les logiciels Winkeyer attendent
+  // une reponse binaire uniquement apres la commande Host Open.
 }
 
 // =====================================================
@@ -592,7 +828,7 @@ void loop() {
   // Priorite au paddle
   paddleKeyer();
 
-  if (paddleState == 0 &&
+  if (!winkeyPaused && !winkeyKeyImmediate && paddleState == 0 &&
       digitalRead(PIN_DIT) == HIGH &&
       digitalRead(PIN_DAH) == HIGH) {
     textKeyer();
